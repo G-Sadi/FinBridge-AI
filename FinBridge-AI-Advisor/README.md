@@ -219,3 +219,22 @@ In your Render deployment configuration:
 - In Render dashboard, set Environment Variable:
   `GEMINI_API_KEY = your_key`
 - Configure your frontend reverse proxy or `VITE_API_BASE_URL` to point to the endpoint.
+
+---
+
+## 🚀 GitHub Pages Deployment (`https://g-sadi.github.io/FinBridge-AI/`)
+
+FinBridge AI is fully configured to run seamlessly on **GitHub Pages** (static hosting) with zero backend server dependencies:
+
+1. **Relative Asset Base (`base: './'`)**:
+   `frontend/vite.config.ts` compiles all asset links to relative paths (`./assets/...`), preventing 404 errors under subpaths like `/FinBridge-AI/`.
+
+2. **Standalone Client-Side Gemini Engine**:
+   When deployed statically to GitHub Pages where a local Python backend is not running, FinBridge AI automatically switches to its browser-side Gemini engine via `frontend/src/geminiService.ts`.
+
+3. **Built-in API Key Manager**:
+   Users can click the **🔑 API Key** button in the header at any time to paste their free Google AI Studio key, which is saved safely in their browser's `localStorage`. If no key is entered, FinBridge operates in educational advisor mode.
+
+4. **Automated GitHub Actions Deployment**:
+   `.github/workflows/deploy.yml` automatically builds the React frontend on push to `main` and deploys the production bundle to GitHub Pages.
+

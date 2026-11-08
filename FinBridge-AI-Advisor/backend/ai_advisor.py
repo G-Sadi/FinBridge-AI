@@ -9,7 +9,7 @@ Endpoints:
 
 Required backend/.env:
   GEMINI_API_KEY=your_real_key
-  GEMINI_MODEL=gemini-3.8-flash
+  GEMINI_MODEL=gemini-3.5-flash-lite
 
 Install dependencies:
   pip install flask flask-cors python-dotenv
@@ -266,8 +266,7 @@ def calculate_finances(context):
 
         return {
             "destination": str(context.get("destination", "Not specified"))[:150],
-            "university": str(context.get("university", "Not specified"))[:150,
-            ],
+            "university": str(context.get("university", "Not specified"))[:150],
             "destCurrency": dest_currency,
             "homeCurrency": home_currency,
             "exchangeRate": rate,

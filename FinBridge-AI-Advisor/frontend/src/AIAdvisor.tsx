@@ -1,6 +1,14 @@
-
 import { useState, useRef, useEffect } from 'react'
 import type { KeyboardEvent } from 'react'
+import {
+  getApiKey,
+  setApiKey,
+  clearApiKey,
+  hasApiKey,
+  testGeminiKey,
+  generateClientAiResponse,
+} from './geminiService'
+import type { CalculationSummary } from './geminiService'
 import './AIAdvisor.css'
 
 export interface FinancialContext {
@@ -82,20 +90,6 @@ const DESTINATION_PRESETS: Record<string, FinancialContext> = {
 type MessageRole = 'user' | 'assistant'
 type BackendMode = 'real' | 'mock' | 'error'
 
-interface CalculationSummary {
-  totalEstimatedCost?: number
-  totalTuition?: number
-  totalLiving?: number
-  initialExpenses?: number
-  convertedAvailableFunds?: number
-  fundingGap?: number
-  coveragePct?: number
-  destCurrency?: string
-  homeCurrency?: string
-  assumedFields?: string[]
-  isEstimate?: boolean
-}
-
 interface Message {
   id: string
   role: MessageRole
@@ -131,8 +125,11 @@ const SUGGESTED_PROMPTS = [
   'How do I calculate and close my funding gap?',
 ]
 
+// Defensive base URL resolution
 const API_BASE = (
-  import.meta.env.VITE_API_BASE_URL || ''
+  typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_BASE_URL
+    ? String(import.meta.env.VITE_API_BASE_URL)
+    : ''
 ).replace(/\/+$/, '')
 
 const API_URL = `${API_BASE}/api`
@@ -149,11 +146,8 @@ function formatTime(date: Date): string {
 }
 
 /**
- * Only send the saved financial profile when the question
- * actually asks about the user's own study plan or budget.
- *
- * A general question about student income must not silently
- * inherit the default Toronto profile.
+ * Checks whether the question specifically asks about the user's personal
+ * study plan numbers so we only attach profile data when relevant.
  */
 function needsFinancialContext(message: string): boolean {
   const text = message.toLowerCase()
@@ -192,13 +186,10 @@ function needsFinancialContext(message: string): boolean {
     /\bafford\b/,
   ]
 
-  // Personal-plan questions explicitly need the saved profile.
   if (planSpecificPatterns.some((pattern) => pattern.test(text))) {
     return true
   }
 
-  // General questions do not automatically use the saved profile.
-  // Examples: student income, typical wages, part-time jobs.
   if (
     /\b(part[- ]time|part time|student)\b/.test(text) &&
     /\b(income|earnings?|wages?|salary|jobs?|work|working)\b/.test(text) &&
@@ -249,6 +240,16 @@ export default function AIAdvisor() {
 
   const [showProfileDrawer, setShowProfileDrawer] = useState(false)
 
+  // API Key management modal state
+  const [showApiKeyModal, setShowApiKeyModal] = useState(false)
+  const [apiKeyInput, setApiKeyInput] = useState(() => getApiKey())
+  const [showKeyPassword, setShowKeyPassword] = useState(false)
+  const [keyValidationStatus, setKeyValidationStatus] = useState<
+    'idle' | 'testing' | 'success' | 'error'
+  >('idle')
+  const [keyValidationMsg, setKeyValidationMsg] = useState('')
+  const [hasUserKey, setHasUserKey] = useState(() => hasApiKey())
+
   const [messages, setMessages] = useState<Message[]>([
     {
       id: 'welcome',
@@ -256,9 +257,8 @@ export default function AIAdvisor() {
       content:
         "Hi! I'm your **FinBridge Study Abroad Finance Advisor**.\n\n" +
         'Ask me about student income, tuition, living expenses, ' +
-        'savings, exchange rates, or your study-abroad budget.\n\n' +
-        'I will answer your question directly and will not assume ' +
-        'your location when you have not provided it.',
+        'savings, exchange rates, or closing your funding gap.\n\n' +
+        'I provide direct answers and never invent assumptions without your confirmation.',
       timestamp: new Date(),
     },
   ])
@@ -267,11 +267,13 @@ export default function AIAdvisor() {
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  const [backendMode, setBackendMode] = useState<
-    'real' | 'mock' | null
-  >(null)
+  const [backendMode, setBackendMode] = useState<'real' | 'mock' | null>(() => {
+    return hasApiKey() ? 'real' : 'mock'
+  })
 
-  const [backendModel, setBackendModel] = useState<string | null>(null)
+  const [backendModel, setBackendModel] = useState<string | null>(() => {
+    return hasApiKey() ? 'gemini-2.5-flash (Client)' : null
+  })
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -305,7 +307,7 @@ export default function AIAdvisor() {
     })
   }, [messages, isLoading])
 
-  // Read the actual model configured by the backend.
+  // Try checking local backend health if running locally
   useEffect(() => {
     const controller = new AbortController()
 
@@ -321,16 +323,20 @@ export default function AIAdvisor() {
 
         const data = (await response.json()) as HealthResponse
 
-        setBackendMode(data.mode === 'real' ? 'real' : 'mock')
-        setBackendModel(data.mode === 'real' ? data.model ?? null : null)
-      } catch (err) {
-        if (err instanceof Error && err.name === 'AbortError') {
-          return
+        if (data.mode === 'real') {
+          setBackendMode('real')
+          setBackendModel(data.model ? `${data.model} (Backend)` : 'Gemini (Backend)')
         }
-
-        // A failed health check does not necessarily mean mock mode.
-        setBackendMode(null)
-        setBackendModel(null)
+      } catch (_) {
+        // Expected when deployed statically to GitHub Pages.
+        // Fall back to client status based on API key presence.
+        if (hasApiKey()) {
+          setBackendMode('real')
+          setBackendModel('gemini-2.5-flash (Client)')
+        } else {
+          setBackendMode('mock')
+          setBackendModel(null)
+        }
       }
     }
 
@@ -349,6 +355,47 @@ export default function AIAdvisor() {
     }
   }, [inputValue])
 
+  async function handleSaveAndTestKey() {
+    const key = apiKeyInput.trim()
+    if (!key) {
+      setKeyValidationStatus('error')
+      setKeyValidationMsg('Please paste a valid Gemini API key.')
+      return
+    }
+
+    setKeyValidationStatus('testing')
+    setKeyValidationMsg('Validating API key with Google Gemini...')
+
+    const testResult = await testGeminiKey(key)
+
+    if (testResult.success) {
+      setApiKey(key)
+      setHasUserKey(true)
+      setBackendMode('real')
+      setBackendModel(`${testResult.model || 'gemini-2.5-flash'} (Client)`)
+      setKeyValidationStatus('success')
+      setKeyValidationMsg('✅ API key verified successfully! Live Gemini AI is now active.')
+      setTimeout(() => {
+        setShowApiKeyModal(false)
+        setKeyValidationStatus('idle')
+        setKeyValidationMsg('')
+      }, 1400)
+    } else {
+      setKeyValidationStatus('error')
+      setKeyValidationMsg(`❌ ${testResult.message}`)
+    }
+  }
+
+  function handleClearKey() {
+    clearApiKey()
+    setApiKeyInput('')
+    setHasUserKey(false)
+    setBackendMode('mock')
+    setBackendModel(null)
+    setKeyValidationStatus('idle')
+    setKeyValidationMsg('API key removed. Running in educational advisor mode.')
+  }
+
   async function sendMessage(textToSend?: string) {
     const text = (textToSend ?? inputValue).trim()
 
@@ -357,20 +404,17 @@ export default function AIAdvisor() {
     setInputValue('')
     setError(null)
 
-    setMessages((previous) => [
-      ...previous,
-      {
-        id: generateId(),
-        role: 'user',
-        content: text,
-        timestamp: new Date(),
-      },
-    ])
+    const userMessage: Message = {
+      id: generateId(),
+      role: 'user',
+      content: text,
+      timestamp: new Date(),
+    }
 
+    setMessages((previous) => [...previous, userMessage])
     setIsLoading(true)
 
     try {
-      // Crucial fix: don't send Toronto profile for unrelated questions.
       const includeContext = needsFinancialContext(text)
 
       const payload: {
@@ -384,13 +428,15 @@ export default function AIAdvisor() {
         payload.context = profile
       }
 
-      const controller = new AbortController()
-      const timeoutId = setTimeout(() => controller.abort(), 100000)
-
-      let response: Response
+      // Step 1: Attempt to contact backend if reachable
+      let backendSuccess = false
+      let apiData: ApiResponse | null = null
 
       try {
-        response = await fetch(`${API_URL}/ai-advisor`, {
+        const controller = new AbortController()
+        const timeoutId = setTimeout(() => controller.abort(), 4000)
+
+        const response = await fetch(`${API_URL}/ai-advisor`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -398,37 +444,60 @@ export default function AIAdvisor() {
           body: JSON.stringify(payload),
           signal: controller.signal,
         })
-      } finally {
         clearTimeout(timeoutId)
+
+        if (response.ok) {
+          apiData = (await response.json()) as ApiResponse
+          if (apiData?.reply) {
+            backendSuccess = true
+          }
+        }
+      } catch (_) {
+        // Backend not available (common on static GitHub Pages)
+        backendSuccess = false
       }
 
-      const data = (await response.json().catch(() => ({}))) as ApiResponse
+      if (backendSuccess && apiData && apiData.reply) {
+        if (apiData.mode) {
+          setBackendMode(apiData.mode === 'real' ? 'real' : 'mock')
+        }
+        if (apiData.model) {
+          setBackendModel(`${apiData.model} (Backend)`)
+        }
 
-      if (!response.ok) {
-        throw new Error(
-          data.details
-            ? `${data.error || 'Request failed'} ${data.details}`
-            : data.error || `Server returned status ${response.status}`,
-        )
+        let answer = apiData.reply
+        if (apiData.truncated || apiData.finishReason === 'MAX_TOKENS') {
+          answer +=
+            '\n\n*Note: The answer may be incomplete because the AI reached its output limit.*'
+        }
+
+        setMessages((previous) => [
+          ...previous,
+          {
+            id: generateId(),
+            role: 'assistant',
+            content: answer,
+            timestamp: new Date(),
+            mode: apiData?.mode === 'mock' ? 'mock' : 'real',
+            calculations: apiData?.calculations,
+          },
+        ])
+        return
       }
 
-      if (data.mode) {
-        setBackendMode(data.mode === 'real' ? 'real' : 'mock')
-      }
+      // Step 2: Standalone Client-Side Gemini Engine (Direct browser call for GitHub Pages)
+      const clientRes = await generateClientAiResponse(
+        text,
+        includeContext ? profile : undefined,
+        [...messages, userMessage].map((m) => ({
+          role: m.role,
+          content: m.content,
+        })),
+      )
 
-      if (data.model) {
-        setBackendModel(data.model)
-      }
-
-      if (!data.reply) {
-        throw new Error('The backend returned an empty answer.')
-      }
-
-      let answer = data.reply
-
-      if (data.truncated || data.finishReason === 'MAX_TOKENS') {
-        answer +=
-          '\n\n*Note: The answer may be incomplete because the AI reached its output limit.*'
+      setBackendMode(clientRes.mode)
+      if (clientRes.model) {
+        setBackendModel(`${clientRes.model} (Client)`)
       }
 
       setMessages((previous) => [
@@ -436,28 +505,17 @@ export default function AIAdvisor() {
         {
           id: generateId(),
           role: 'assistant',
-          content: answer,
+          content: clientRes.reply,
           timestamp: new Date(),
-          mode: data.mode === 'mock' ? 'mock' : 'real',
-          calculations: data.calculations,
+          mode: clientRes.mode,
+          calculations: clientRes.calculations,
         },
       ])
     } catch (err) {
-      let errorMessage =
+      const errorMessage =
         err instanceof Error
           ? err.message
-          : 'An unexpected network error occurred.'
-
-      if (err instanceof Error && err.name === 'AbortError') {
-        errorMessage =
-          'The request timed out. Check the backend server and try again.'
-      } else if (
-        errorMessage.includes('Failed to fetch') ||
-        errorMessage.includes('NetworkError')
-      ) {
-        errorMessage =
-          'Cannot connect to the backend. Start the Flask server and check your API URL and CORS settings.'
-      }
+          : 'An unexpected error occurred while processing your request.'
 
       setError(`⚠️ ${errorMessage}`)
     } finally {
@@ -483,6 +541,111 @@ export default function AIAdvisor() {
 
   return (
     <div className="finbridge-advisor-wrapper">
+      {/* Google Gemini API Key Configuration Modal */}
+      {showApiKeyModal && (
+        <div
+          className="api-key-modal-overlay"
+          onClick={() => setShowApiKeyModal(false)}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="modal-api-title"
+        >
+          <div
+            className="api-key-modal-content"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="modal-header">
+              <div className="modal-title-group">
+                <span className="modal-icon">🔑</span>
+                <h3 id="modal-api-title" className="modal-title">
+                  Google Gemini AI Settings
+                </h3>
+              </div>
+              <button
+                type="button"
+                className="modal-close-btn"
+                onClick={() => setShowApiKeyModal(false)}
+                aria-label="Close API settings"
+              >
+                ✕
+              </button>
+            </div>
+
+            <p className="modal-description">
+              On static hosting like <strong>GitHub Pages</strong>, FinBridge AI
+              connects directly to Google Gemini from your browser. Your key is stored
+              safely in your local browser storage.
+            </p>
+
+            <div className="key-input-wrapper">
+              <input
+                type={showKeyPassword ? 'text' : 'password'}
+                className="key-input"
+                placeholder="AIzaSy... (Paste Google Gemini API Key)"
+                value={apiKeyInput}
+                onChange={(e) => setApiKeyInput(e.target.value)}
+                autoComplete="off"
+                spellCheck="false"
+              />
+              <button
+                type="button"
+                className="key-toggle-vis-btn"
+                onClick={() => setShowKeyPassword((prev) => !prev)}
+                title={showKeyPassword ? 'Hide Key' : 'Show Key'}
+                aria-label={showKeyPassword ? 'Hide Key' : 'Show Key'}
+              >
+                {showKeyPassword ? '👁️' : '🔒'}
+              </button>
+            </div>
+
+            {keyValidationMsg && (
+              <div className={`key-status-banner ${keyValidationStatus}`} role="alert">
+                {keyValidationMsg}
+              </div>
+            )}
+
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="save-key-btn"
+                onClick={() => void handleSaveAndTestKey()}
+                disabled={keyValidationStatus === 'testing'}
+              >
+                {keyValidationStatus === 'testing' ? (
+                  <>
+                    <span className="btn-spinner" /> Validating...
+                  </>
+                ) : (
+                  'Save & Activate Key'
+                )}
+              </button>
+
+              {hasUserKey && (
+                <button
+                  type="button"
+                  className="clear-key-btn"
+                  onClick={handleClearKey}
+                >
+                  Clear Key
+                </button>
+              )}
+            </div>
+
+            <div className="modal-footer-help">
+              Don't have an API key?{' '}
+              <a
+                href="https://aistudio.google.com/app/apikey"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                Get a free key from Google AI Studio ↗
+              </a>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Main App Header */}
       <header className="finbridge-header">
         <div className="header-brand">
           <div className="brand-logo-icon">
@@ -515,30 +678,39 @@ export default function AIAdvisor() {
         </div>
 
         <div className="header-badges">
-          <span className="badge-pill sample-badge">
-            <span className="sample-dot" /> Illustrative estimates
+          <button
+            type="button"
+            className={`key-config-btn ${hasUserKey ? 'has-key' : 'needs-key'}`}
+            onClick={() => {
+              setApiKeyInput(getApiKey())
+              setKeyValidationStatus('idle')
+              setKeyValidationMsg('')
+              setShowApiKeyModal(true)
+            }}
+            title="Configure Gemini API Key"
+          >
+            🔑 {hasUserKey ? 'Gemini Live' : 'API Key'}
+          </button>
+
+          <span
+            className={`badge-pill mode-badge ${
+              backendMode === 'real' ? 'real' : 'mock'
+            }`}
+            title={
+              backendMode === 'real'
+                ? `Active model: ${backendModel || 'Gemini AI'}`
+                : 'Running in educational advisor mode'
+            }
+          >
+            {backendMode === 'real'
+              ? backendModel
+                ? `✓ ${backendModel}`
+                : '✓ Gemini Live'
+              : '💡 Educational Guide'}
           </span>
 
-          {backendMode && (
-            <span
-              className={`badge-pill mode-badge ${
-                backendMode === 'real' ? 'real' : 'mock'
-              }`}
-              title={
-                backendMode === 'real'
-                  ? `Model configured by backend: ${backendModel || 'not reported'}`
-                  : 'Backend is in mock mode'
-              }
-            >
-              {backendMode === 'real'
-                ? backendModel
-                  ? `✓ ${backendModel} Active`
-                  : '✓ Gemini AI Connected'
-                : '🔶 Mock Mode'}
-            </span>
-          )}
-
           <button
+            type="button"
             className="planner-toggle-btn"
             onClick={() => setShowProfileDrawer((open) => !open)}
             aria-expanded={showProfileDrawer}
@@ -549,25 +721,30 @@ export default function AIAdvisor() {
         </div>
       </header>
 
+      {/* Mock Notice Bar if no key */}
       {backendMode === 'mock' && (
         <div className="mock-notice-bar" role="alert">
-          <span className="mock-icon">🔶</span>
+          <span className="mock-icon">💡</span>
           <div className="mock-text">
-            <strong>Mock Mode Active:</strong> A live Gemini response
-            is not currently available. Check <code>backend/.env</code>,
-            the API key, and restart the server.
+            <strong>Educational Guide Mode:</strong> You are receiving automated
+            financial formulas and rules. To unlock dynamic live Gemini responses on GitHub Pages,
             {' '}
-            <a
-              href="https://aistudio.google.com/app/apikey"
-              target="_blank"
-              rel="noopener noreferrer"
+            <button
+              type="button"
+              className="inline-key-btn"
+              onClick={() => {
+                setApiKeyInput(getApiKey())
+                setShowApiKeyModal(true)
+              }}
             >
-              Manage Gemini API keys
-            </a>
+              Add your free Gemini API key
+            </button>
+            .
           </div>
         </div>
       )}
 
+      {/* Snapshot Card */}
       <section className="snapshot-card" aria-label="Financial summary">
         <div className="snapshot-header">
           <div className="snapshot-title-group">
@@ -581,6 +758,7 @@ export default function AIAdvisor() {
           </div>
 
           <button
+            type="button"
             className="snapshot-edit-btn"
             onClick={() => setShowProfileDrawer((open) => !open)}
           >
@@ -791,6 +969,7 @@ export default function AIAdvisor() {
             </div>
 
             <button
+              type="button"
               className="ask-plan-btn"
               onClick={() => {
                 setShowProfileDrawer(false)
@@ -805,6 +984,7 @@ export default function AIAdvisor() {
         )}
       </section>
 
+      {/* Messages Stream */}
       <main className="messages-stream" role="log" aria-live="polite">
         {messages.map((msg) => (
           <div
@@ -842,7 +1022,10 @@ export default function AIAdvisor() {
                   {formatTime(msg.timestamp)}
                 </span>
                 {msg.mode === 'mock' && (
-                  <span className="mock-tag">DEMO MOCK</span>
+                  <span className="mock-tag">GUIDE</span>
+                )}
+                {msg.mode === 'real' && (
+                  <span className="live-tag">GEMINI AI</span>
                 )}
               </div>
             </div>
@@ -874,6 +1057,7 @@ export default function AIAdvisor() {
           <div className="alert-error-banner" role="alert">
             <span>{error}</span>
             <button
+              type="button"
               className="dismiss-btn"
               onClick={() => setError(null)}
               aria-label="Dismiss message"
@@ -886,6 +1070,7 @@ export default function AIAdvisor() {
         <div ref={messagesEndRef} />
       </main>
 
+      {/* Suggested Prompt Chips */}
       {messages.length <= 2 && !isLoading && (
         <section
           className="suggested-chips-section"
@@ -899,6 +1084,7 @@ export default function AIAdvisor() {
             {SUGGESTED_PROMPTS.map((prompt) => (
               <button
                 key={prompt}
+                type="button"
                 className="chip-btn"
                 onClick={() => void sendMessage(prompt)}
                 disabled={isLoading}
@@ -910,6 +1096,7 @@ export default function AIAdvisor() {
         </section>
       )}
 
+      {/* Footer / Input Bar */}
       <footer className="advisor-footer">
         <div className="input-bar-container">
           <textarea
@@ -926,6 +1113,7 @@ export default function AIAdvisor() {
           />
 
           <button
+            type="button"
             className={`send-action-btn ${
               isLoading || !inputValue.trim() ? 'disabled' : ''
             }`}
@@ -961,6 +1149,17 @@ export default function AIAdvisor() {
           sources.
         </p>
       </footer>
+
+      {/* Floating Chat Quick Launcher Button */}
+      <button
+        type="button"
+        className="floating-chat-launcher"
+        onClick={() => textareaRef.current?.focus()}
+        title="Open FinBridge Chat Input"
+        aria-label="Open FinBridge Chat Input"
+      >
+        🧭
+      </button>
     </div>
   )
 }
