@@ -16,12 +16,12 @@ concurrency:
 
 jobs:
   build-and-deploy:
-    runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Node.js 20
@@ -31,16 +31,34 @@ jobs:
 
       - name: Install dependencies and build frontend
         run: |
+          mkdir -p $GITHUB_WORKSPACE/deploy-dist
+
           if [ -d "FinBridge-AI-Advisor/frontend" ]; then
             cd FinBridge-AI-Advisor/frontend
           elif [ -d "frontend" ]; then
             cd frontend
           fi
-          echo "Current directory: $(pwd)"
-          npm ci || npm install
-          npm run build
-          mkdir -p $GITHUB_WORKSPACE/deploy-dist
-          cp -r dist/* $GITHUB_WORKSPACE/deploy-dist/
+
+          if [ -f "package.json" ]; then
+            echo "Installing dependencies in $(pwd)..."
+            npm ci || npm install
+            echo "Building frontend bundle..."
+            npm run build
+            if [ -d "dist" ]; then
+              cp -r dist/* $GITHUB_WORKSPACE/deploy-dist/
+            fi
+          fi
+
+          # Ensure deploy-dist has production index.html (fallback to root static distribution if needed)
+          if [ ! -f "$GITHUB_WORKSPACE/deploy-dist/index.html" ] && [ -f "$GITHUB_WORKSPACE/index.html" ]; then
+            echo "Syncing root static distribution to deploy-dist..."
+            cp -r $GITHUB_WORKSPACE/index.html $GITHUB_WORKSPACE/assets $GITHUB_WORKSPACE/deploy-dist/
+          fi
+
+      - name: Bypass Jekyll processing
+        run: |
+          touch $GITHUB_WORKSPACE/.nojekyll
+          touch $GITHUB_WORKSPACE/deploy-dist/.nojekyll
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
@@ -53,4 +71,3 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
-
